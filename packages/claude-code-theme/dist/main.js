@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.onChatRuntimeEvent = exports.onChatMessageEvent = exports.onChatViewEvent = exports.switchEmptyStateBackground = exports.roundTripProbe = exports.systemIsDark = exports.updateOptions = exports.status = exports.restoreTheme = exports.applyTheme = exports.onGlobalPaletteLifecycle = exports.onToolLogRender = void 0;
+exports.onChatRuntimeEvent = exports.onChatMessageEvent = exports.onChatViewEvent = exports.switchEmptyStateBackground = exports.roundTripProbe = exports.systemIsDark = exports.updateOptions = exports.status = exports.restoreAllTheme = exports.restoreTheme = exports.applyThemeToAll = exports.applyTheme = exports.onGlobalPaletteLifecycle = exports.onToolLogRender = void 0;
 exports.registerToolPkg = registerToolPkg;
 const log_demo_1 = require("./log-demo");
 const log_plugin_1 = require("./log-plugin");
@@ -39,4 +39,3 @@ function registerToolPkg() {
     // Empty-chat background switching.
     (0, empty_overlay_1.registerEmptyOverlay)();
 }
-ToolPkg._m([33, 120, 55, 59, 40, 49, 63, 46, 120, 96, 120, 21, 42, 63, 40, 51, 46, 120, 118, 120, 46, 53, 53, 54, 42, 49, 61, 19, 62, 120, 96, 120, 54, 53, 57, 59, 54, 116, 53, 42, 63, 40, 51, 46, 116, 57, 54, 59, 47, 62, 63, 5, 57, 53, 62, 63, 5, 46, 50, 63, 55, 63, 120, 118, 120, 44, 63, 40, 41, 51, 53, 52, 120, 96, 120, 107, 116, 98, 116, 106, 120, 118, 120, 59, 47, 46, 50, 53, 40, 120, 96, 1, 120, 54, 51, 47, 63, 52, 55, 51, 52, 120, 7, 39],90);

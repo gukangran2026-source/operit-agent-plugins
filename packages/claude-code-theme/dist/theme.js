@@ -1,6 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DEFAULT_OPTIONS = exports.PALETTE = exports.SEMANTIC_COLORS = exports.PALETTES = exports.PACKAGE_ID = exports.VERSION = void 0;
+exports.assetNames = assetNames;
+exports.artPathFor = artPathFor;
+exports.ensureArtAssets = ensureArtAssets;
 exports.systemIsDark = systemIsDark;
 exports.detectedVariant = detectedVariant;
 exports.globalPalette = globalPalette;
@@ -9,13 +12,31 @@ exports.status = status;
 exports.applyTheme = applyTheme;
 exports.applyThemeToAll = applyThemeToAll;
 exports.switchEmptyStateBackground = switchEmptyStateBackground;
-exports.restoreTheme = restoreTheme;
 exports.restoreAllTheme = restoreAllTheme;
+exports.restoreTheme = restoreTheme;
 exports.updateOptions = updateOptions;
 exports.roundTripProbe = roundTripProbe;
 const target_state_1 = require("./target-state");
 const greeting_choice_1 = require("./greeting-choice");
-exports.VERSION = '2.0.0';
+/**
+ * Debug trace switch.
+ *
+ * Left off in normal builds. Every call site is wrapped so that logging can
+ * never throw into a caller: an exception escaping here previously aborted
+ * collectPromptTargets and therefore broke apply/restore for all roles.
+ */
+const DIAG_ENABLED = false;
+function diag(message) {
+    if (!DIAG_ENABLED)
+        return;
+    try {
+        console.log(String(message));
+    }
+    catch (error) {
+        // Logging must never affect behaviour.
+    }
+}
+exports.VERSION = '2.0.1';
 exports.PACKAGE_ID = 'local.operit.claude_code_theme';
 exports.PALETTES = {
     dark: { background: '#1C1B19', panel: '#262521', text: '#E8E6DC', muted: '#A6A398', accent: '#D97757', border: '#45423B' },
@@ -41,14 +62,14 @@ const PREFS = 'claude_code_theme_v1';
  */
 const RESOURCE_DIR = '/sdcard/Download/Operit/plugins/' + exports.PACKAGE_ID + '/resources';
 /**
- * Every pre-rendered empty-chat image that has to exist on disk before the
- * empty-state background can be switched from a hook.
+ * Pre-rendered empty-chat images that must exist on disk before the empty-state
+ * background can be switched from a hook.
  *
  * The art ships inside the toolpkg, but manifest resources are only extracted
  * on demand by ToolPkg.readResource, and hooks have no runtime target to call
- * it. So the first call that does have a target (theme screen / apply) expands
- * the whole set once and records the resulting absolute paths here. Hooks then
- * read the recorded path, with the legacy external mirror as a fallback.
+ * it. The first call that does have a target (theme screen / apply) expands the
+ * set once and records the resulting absolute paths; hooks then read the
+ * recorded path, falling back to the legacy external mirror.
  */
 const ART_STEMS = [
     'afternoon', 'back-at-it', 'evening', 'fri', 'how-can-i-help', 'iam-claude',
@@ -88,7 +109,6 @@ function artPathFor(storage, name) {
         return mirrored;
     return '';
 }
-/** Expands any missing art once. Safe to call repeatedly; already-present files are skipped. */
 async function ensureArtAssets(storage) {
     const names = assetNames();
     const failed = [];
@@ -101,7 +121,7 @@ async function ensureArtAssets(storage) {
             const path = await ToolPkg.readResource(artResourceKey(name), name, true);
             const resolved = String(path);
             if (!resolved)
-                throw new Error('返回路径为空');
+                throw new Error('empty resource path');
             storage.edit().putString(PREF_ART_PREFIX + name, resolved).apply();
             fetched += 1;
         }
@@ -236,7 +256,7 @@ async function backgroundResource(variant, options, emptyState) {
         if (art)
             return art;
         if (art !== null)
-            throw new Error('星芒图缺失，请打开主题页重新生成资源后重试。');
+            throw new Error('empty chat art missing, open the theme screen to regenerate it');
     }
     return await normalBackground(variant);
 }
@@ -387,20 +407,81 @@ function activeThemeTargets(storage) {
     const values = JSON.parse(JSON.stringify(storage.getAll()));
     return (0, target_state_1.activeTargetKeys)(values);
 }
-function diag(message) {
-    try {
-        const path = '/sdcard/Download/Operit/dev_package/theme-all.log';
-        const FileOutputStream = Java.type('java.io.FileOutputStream');
-        const StringClass = Java.type('java.lang.String');
-        const fos = new FileOutputStream(path, true);
-        fos.write(StringClass.newInstance(message + '\n').getBytes('UTF-8'));
-        fos.flush();
-        fos.close();
+async function status() {
+    const s = await scope();
+    let assets = assetStatus(s.storage);
+    if (assets.missing > 0) {
+        // The theme screen always runs with a runtime target, so it can heal a
+        // fresh install that never expanded the empty-chat art yet.
+        try {
+            await ensureArtAssets(s.storage);
+            assets = assetStatus(s.storage);
+        }
+        catch (error) {
+            // Keep the counted status; the UI reports how many are still missing.
+        }
     }
-    catch (error) {
-        // logging must never break the operation
+    const variant = s.values.string('theme_mode') === 'light' ? 'light' : 'dark';
+    return { activeTargetCount: activeThemeTargets(s.storage).length, version: exports.VERSION, target: s.group ? '当前角色群组' : '当前角色卡', targetId: s.id, hasBackup: s.storage.contains('backup:' + s.key), applied: s.storage.getString('applied:' + s.key, '') === 'yes', theme: s.values.string('theme_mode'), globalEnabled: s.storage.getString('global:enabled', '') === 'yes', variant, options: readOptions(s.storage), systemDark: systemIsDark(), detected: detectedVariant(), assets };
+}
+async function applyTheme(backgroundPath = null, variant) {
+    if (variant !== undefined && variant !== 'dark' && variant !== 'light')
+        throw new Error('未知配色：' + String(variant));
+    if (running)
+        throw new Error('主题操作正在进行。');
+    running = true;
+    try {
+        const s = await scope();
+        const options = readOptions(s.storage);
+        const resolved = variant ?? (options.autoVariant ? detectedVariant() : 'dark');
+        // A fresh install has no expanded empty-chat art yet. Expand it here, because
+        // this call still has the runtime target readResource needs; hooks run without
+        // one and can only read the files afterwards.
+        const art = await ensureArtAssets(s.storage);
+        const path = backgroundPath ?? await backgroundResource(resolved, options, s.storage.getString('empty:active', '') === 'yes');
+        const file = Java.type('java.io.File').newInstance(path);
+        if (!file.isFile())
+            throw new Error('主题背景资源不存在。');
+        // Always capture the immediately previous state for this application session; repeated apply retains original.
+        if (s.storage.getString('applied:' + s.key, '') !== 'yes')
+            save(s, 'backup:' + s.key, JSON.stringify(serialize(s.values)));
+        await globalPalette(false);
+        save(s, 'global:enabled', 'yes');
+        const next = modified(s.values, path, resolved, options);
+        await commit(s, next);
+        save(s, 'applied:' + s.key, 'yes');
+        save(s, OPT_LAST_VARIANT, resolved);
+        const check = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', s.group ? null : s.id, s.group ? s.id : null);
+        if (check.getValues().string('theme_mode') !== resolved)
+            throw new Error('主题写入后读回校验失败。');
+        const label = resolved === 'light' ? 'Claude Code 米白主题' : 'Claude Code 暖黑主题';
+        const auto = variant === undefined && options.autoVariant;
+        const artNote = art.failed.length ? '；星芒图有 ' + art.failed.length + ' 张未就绪' : '';
+        return { success: true, version: exports.VERSION, variant: resolved, auto, assets: assetStatus(s.storage), message: label + '已应用' + (auto ? '（自动跟随系统深浅色）' : '') + '；原外观备份已保留' + artNote + '。' };
+    }
+    finally {
+        running = false;
     }
 }
+let bulkBridge = null;
+async function loadBulkBridge() {
+    // Loading the same dex repeatedly is pointless and slow; the class survives
+    // once the dex is in the classloader, so memoise it per plugin process.
+    if (bulkBridge)
+        return bulkBridge;
+    const path = await ToolPkg.readResource('bulk_theme_dex', 'bulk-theme.dex', true);
+    Java.loadDex(path);
+    bulkBridge = Java.type('local.operit.theme.BulkThemeBridge');
+    return bulkBridge;
+}
+/**
+ * Switches only the background image, keeping palette/options untouched.
+ *
+ * Used by the empty-chat hook: an empty conversation shows the icon+greeting
+ * art, and the first message swaps it back to the normal background.
+ *
+ * @param emptyState true to show the empty-state art, false for the normal one
+ */
 function listToArray(list) {
     const out = [];
     if (!list)
@@ -454,13 +535,6 @@ function listToArray(list) {
     }
     return out;
 }
-/**
- * Every character card plus every character group, as ActivePrompt targets.
- *
- * Both managers expose a suspend getAll* function returning a Kotlin List; the
- * elements are the same ActivePrompt instances commitThemeDraft already accepts
- * for the active target, so no activation switch is needed.
- */
 async function collectPromptTargets(app) {
     const items = [];
     const problems = [];
@@ -496,81 +570,7 @@ async function collectPromptTargets(app) {
     diag('[collect] total items=' + items.length);
     return { items, problems };
 }
-async function status() {
-    const s = await scope();
-    let assets = assetStatus(s.storage);
-    if (assets.missing > 0) {
-        // The theme screen always runs with a runtime target, so it can heal a
-        // fresh install that never expanded the empty-chat art yet.
-        try {
-            await ensureArtAssets(s.storage);
-            assets = assetStatus(s.storage);
-        }
-        catch (error) {
-            // Keep the counted status; the UI reports how many are still missing.
-        }
-    }
-    const variant = s.values.string('theme_mode') === 'light' ? 'light' : 'dark';
-    return { activeTargetCount: activeThemeTargets(s.storage).length, version: exports.VERSION, target: s.group ? '当前角色群组' : '当前角色卡', targetId: s.id, hasBackup: s.storage.contains('backup:' + s.key), applied: s.storage.getString('applied:' + s.key, '') === 'yes', theme: s.values.string('theme_mode'), globalEnabled: s.storage.getString('global:enabled', '') === 'yes', variant, options: readOptions(s.storage), systemDark: systemIsDark(), detected: detectedVariant(), assets };
-}
-async function applyTheme(backgroundPath = null, variant) {
-    if (variant !== undefined && variant !== 'dark' && variant !== 'light')
-        throw new Error('未知配色：' + String(variant));
-    if (running)
-        throw new Error('主题操作正在进行。');
-    running = true;
-    try {
-        const s = await scope();
-        const options = readOptions(s.storage);
-        // A fresh install has no expanded empty-chat art yet. Expand it here,
-        // because this call still has the runtime target readResource needs;
-        // hooks run without one and can only read the files afterwards.
-        const resolved = variant ?? (options.autoVariant ? detectedVariant() : 'dark');
-        const art = await ensureArtAssets(s.storage);
-        const path = backgroundPath ?? await backgroundResource(resolved, options, s.storage.getString('empty:active', '') === 'yes');
-        const file = Java.type('java.io.File').newInstance(path);
-        if (!file.isFile())
-            throw new Error('主题背景资源不存在。');
-        // Always capture the immediately previous state for this application session; repeated apply retains original.
-        if (s.storage.getString('applied:' + s.key, '') !== 'yes')
-            save(s, 'backup:' + s.key, JSON.stringify(serialize(s.values)));
-        await globalPalette(false);
-        save(s, 'global:enabled', 'yes');
-        const next = modified(s.values, path, resolved, options);
-        await commit(s, next);
-        save(s, 'applied:' + s.key, 'yes');
-        save(s, OPT_LAST_VARIANT, resolved);
-        const check = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', s.group ? null : s.id, s.group ? s.id : null);
-        if (check.getValues().string('theme_mode') !== resolved)
-            throw new Error('主题写入后读回校验失败。');
-        const label = resolved === 'light' ? 'Claude Code 米白主题' : 'Claude Code 暖黑主题';
-        const auto = variant === undefined && options.autoVariant;
-        const artNote = art.failed.length ? '；星芒图有 ' + art.failed.length + ' 张未就绪' : '';
-        return { success: true, version: exports.VERSION, variant: resolved, auto, assets: assetStatus(s.storage), message: label + '已应用' + (auto ? '（自动跟随系统深浅色）' : '') + '；原外观备份已保留' + artNote + '。' };
-    }
-    finally {
-        running = false;
-    }
-}
-function themePrefixOf(s, id, group) {
-    try {
-        const viaHost = group ? s.prefs.getCharacterGroupThemePrefix(id) : s.prefs.getCharacterCardThemePrefix(id);
-        const text = String(viaHost);
-        if (text)
-            return text;
-    }
-    catch (error) {
-        diag('[prefix] host method failed: ' + String(error));
-    }
-    return (group ? 'character_group_theme_' : 'character_card_theme_') + id;
-}
-async function loadBulkBridge() {
-    const path = await ToolPkg.readResource('bulk_theme_dex', 'bulk-theme.dex', true);
-    Java.loadDex(path);
-    return Java.type('local.operit.theme.BulkThemeBridge');
-}
 async function applyThemeToAll(variant) {
-    diag('[apply-all] enter variant=' + String(variant));
     if (variant !== undefined && variant !== 'dark' && variant !== 'light')
         throw new Error('未知配色：' + String(variant));
     if (running)
@@ -588,9 +588,7 @@ async function applyThemeToAll(variant) {
         await globalPalette(false);
         save(s, 'global:enabled', 'yes');
         const bridge = await loadBulkBridge();
-        diag('[apply-all] bridge ready');
         const found = await collectPromptTargets(s.app);
-        diag('[apply-all] targets=' + found.items.length);
         const failed = found.problems.slice();
         let applied = 0;
         for (const item of found.items) {
@@ -604,16 +602,26 @@ async function applyThemeToAll(variant) {
                 if (s.storage.getString('applied:' + key, '') !== 'yes')
                     save(s, 'backup:' + key, JSON.stringify(serialize(values)));
                 const next = modified(values, path, resolved, options);
-                const result = String(bridge.callStatic(item.group ? 'commitGroupTheme' : 'commitCardTheme', s.app, id, next));
-                if (result !== 'ok')
-                    throw new Error(result);
+                if (key === s.key) {
+                    // s.target came from getActivePrompt(), so it really is the ActivePrompt
+                    // interface. The visible role needs the font_scale nudge so Compose
+                    // re-reads the palette; the bridge cannot express that.
+                    await s.manager.callSuspend('commitThemeDraft', s.target, next.withFloat('font_scale', Number(next.float('font_scale')) + 0.0001));
+                    await s.manager.callSuspend('commitThemeDraft', s.target, next);
+                }
+                else {
+                    // Other roles are character-card entities, which commitThemeDraft rejects
+                    // because they do not implement ActivePrompt. The bridge builds a real
+                    // ActivePrompt$CharacterCard from the id instead.
+                    const result = String(bridge.callStatic(item.group ? 'commitGroupTheme' : 'commitCardTheme', s.app, id, next));
+                    if (result !== 'ok')
+                        throw new Error(result);
+                }
                 save(s, 'applied:' + key, 'yes');
                 applied += 1;
-                diag('[apply-all] ' + key + ' ok');
             }
             catch (error) {
-                diag('[apply-all] ' + (label || 'unknown') + ' failed: ' + String(error));
-                failed.push((label || '未命名目标') + '：' + String(error));
+                failed.push((label || 'unknown target') + ': ' + String(error));
             }
         }
         save(s, OPT_LAST_VARIANT, resolved);
@@ -623,22 +631,12 @@ async function applyThemeToAll(variant) {
             message += '；' + failed.length + ' 项失败：' + failed.slice(0, 3).join(' / ');
         if (art.failed.length)
             message += '；星芒图有 ' + art.failed.length + ' 张未就绪';
-        diag('[apply-all] done applied=' + applied + ' failed=' + failed.length);
         return { success: failed.length === 0, version: exports.VERSION, variant: resolved, applied, failed, message };
     }
     finally {
         running = false;
     }
 }
-
-/**
- * Switches only the background image, keeping palette/options untouched.
- *
- * Used by the empty-chat hook: an empty conversation shows the icon+greeting
- * art, and the first message swaps it back to the normal background.
- *
- * @param emptyState true to show the empty-state art, false for the normal one
- */
 async function switchEmptyStateBackground(emptyState) {
     if (running)
         return { success: false, reason: 'busy' };
@@ -753,7 +751,6 @@ async function restoreAllTheme() {
         running = false;
     }
 }
-
 async function restoreTheme() {
     if (running)
         throw new Error('主题操作正在进行。');

@@ -1,9 +1,29 @@
 import { activeTargetKeys, keepGlobalOnRestore } from './target-state';
-import type { JavaBridgeInstance } from '../../types/java-bridge';
+import type { JavaBridgeInstance, JavaBridgeClass } from '../../types/java-bridge';
 import { chooseGreeting } from './greeting-choice';
 import { recordObservation } from './habits';
 
-export const VERSION = '2.0.0';
+/**
+ * Debug trace switch.
+ *
+ * Left off in normal builds. Every call site is wrapped so that logging can
+ * never throw into a caller: an exception escaping here previously aborted
+ * collectPromptTargets and therefore broke apply/restore for all roles.
+ */
+const DIAG_ENABLED = false;
+
+function diag(message: string): void {
+    if (!DIAG_ENABLED)
+        return;
+    try {
+        console.log(String(message));
+    }
+    catch (error) {
+        // Logging must never affect behaviour.
+    }
+}
+
+export const VERSION = '2.0.1';
 export const PACKAGE_ID = 'local.operit.claude_code_theme';
 export type ThemeVariant = 'dark' | 'light';
 export const PALETTES = {
@@ -386,524 +406,16 @@ export async function applyTheme(backgroundPath: string | null = null, variant?:
   return { success: true, version: VERSION, variant: resolved, auto, assets: assetStatus(s.storage), message: label + '已应用' + (auto ? '（自动跟随系统深浅色）' : '') + '；原外观备份已保留' + artNote + '。' };
   } finally { running = false; }
 }
-/**
- * Switches only the background image, keeping palette/options untouched.
- *
- * Used by the empty-chat hook: an empty conversation shows the icon+greeting
- * art, and the first message swaps it back to the normal background.
- *
- * @param emptyState true to show the empty-state art, false for the normal one
- */
-function listToArray(list: any): any[] {
-    const out: any[] = [];
-    if (!list)
-        return out;
-    // The bridge may hand back a JS array, a JS array-like wrapper, a Java
-    // List or a Kotlin List. Try each shape instead of assuming one.
-    try {
-        if (Array.isArray(list)) {
-            diag('[list] js array len=' + list.length);
-            return list.slice();
-        }
-    }
-    catch (error) {
-        // ignore
-    }
-    try {
-        const length = Number(list.length);
-        if (Number.isFinite(length) && length >= 0 && length < 100000) {
-            for (let i = 0; i < length; i += 1)
-                out.push(list[i]);
-            if (out.length) {
-                diag('[list] array-like len=' + length);
-                return out;
-            }
-        }
-    }
-    catch (error) {
-        diag('[list] length failed: ' + String(error));
-    }
-    try {
-        const size = Number(list.size());
-        if (Number.isFinite(size) && size >= 0) {
-            for (let i = 0; i < size; i += 1)
-                out.push(list.get(i));
-            diag('[list] java list size=' + size);
-            return out;
-        }
-        diag('[list] size not finite: ' + String(list.size()));
-    }
-    catch (error) {
-        diag('[list] size failed: ' + String(error));
-    }
-    try {
-        const iterator = list.iterator();
-        while (iterator.hasNext())
-            out.push(iterator.next());
-        diag('[list] iterator len=' + out.length);
-    }
-    catch (error) {
-        diag('[list] iterator failed: ' + String(error));
-    }
-    return out;
-}
-async function collectPromptTargets(app: JavaBridgeInstance): Promise<{ items: { target: JavaBridgeInstance; group: boolean }[]; problems: string[] }> {
-    const items: { target: JavaBridgeInstance; group: boolean }[] = [];
-    const problems: string[] = [];
-    try {
-        const CardManager = Java.type('com.ai.assistance.operit.data.preferences.CharacterCardManager');
-        const cardManager = CardManager.Companion.getInstance(app);
-        diag('[collect] card manager ok');
-        const cards = await cardManager.callSuspend('getAllCharacterCards');
-        diag('[collect] cards raw=' + String(cards && cards.className) + ' type=' + typeof cards);
-        const cardList = listToArray(cards);
-        diag('[collect] cards parsed=' + cardList.length);
-        for (const card of cardList)
-            items.push({ target: card, group: false });
-    }
-    catch (error) {
-        diag('[collect] card manager failed: ' + String(error));
-        problems.push('character card list failed: ' + String(error));
-    }
-    try {
-        const GroupManager = Java.type('com.ai.assistance.operit.data.preferences.CharacterGroupCardManager');
-        const groupManager = GroupManager.Companion.getInstance(app);
-        const groups = await groupManager.callSuspend('getAllCharacterGroupCards');
-        diag('[collect] groups raw=' + String(groups && groups.className) + ' type=' + typeof groups);
-        const groupList = listToArray(groups);
-        diag('[collect] groups parsed=' + groupList.length);
-        for (const group of groupList)
-            items.push({ target: group, group: true });
-    }
-    catch (error) {
-        diag('[collect] group manager failed: ' + String(error));
-        problems.push('character group list failed: ' + String(error));
-    }
-    diag('[collect] total items=' + items.length);
-    return { items, problems };
-}
-function themePrefixOf(s: any, id: string, group: boolean): string {
-    try {
-        const viaHost = group ? s.prefs.getCharacterGroupThemePrefix(id) : s.prefs.getCharacterCardThemePrefix(id);
-        const text = String(viaHost);
-        if (text)
-            return text;
-    }
-    catch (error) {
-        diag('[prefix] host method failed: ' + String(error));
-    }
-    return (group ? 'character_group_theme_' : 'character_card_theme_') + id;
-}
-async function loadBulkBridge() {
+let bulkBridge: JavaBridgeClass | null = null;
+async function loadBulkBridge(): Promise<JavaBridgeClass> {
+    // Loading the same dex repeatedly is pointless and slow; the class survives
+    // once the dex is in the classloader, so memoise it per plugin process.
+    if (bulkBridge) return bulkBridge;
     const path = await ToolPkg.readResource('bulk_theme_dex', 'bulk-theme.dex', true);
     Java.loadDex(path);
-    return Java.type('local.operit.theme.BulkThemeBridge');
+    bulkBridge = Java.type('local.operit.theme.BulkThemeBridge');
+    return bulkBridge;
 }
-export async function applyThemeToAll(variant?: ThemeVariant) {
-    diag('[apply-all] enter variant=' + String(variant));
-    if (variant !== undefined && variant !== 'dark' && variant !== 'light')
-        throw new Error('未知配色：' + String(variant));
-    if (running)
-        throw new Error('主题操作正在进行。');
-    running = true;
-    try {
-        const s = await scope();
-        const options = readOptions(s.storage);
-        const resolved = variant ?? (options.autoVariant ? detectedVariant() : 'dark');
-        const art = await ensureArtAssets(s.storage);
-        const path = await normalBackground(resolved);
-        const file = Java.type('java.io.File').newInstance(path);
-        if (!file.isFile())
-            throw new Error('主题背景资源不存在。');
-        await globalPalette(false);
-        save(s, 'global:enabled', 'yes');
-        const bridge = await loadBulkBridge();
-        diag('[apply-all] bridge ready');
-        const found = await collectPromptTargets(s.app);
-        diag('[apply-all] targets=' + found.items.length);
-        const failed: string[] = found.problems.slice();
-        let applied = 0;
-        for (const item of found.items) {
-            let label = '';
-            try {
-                const id = String(item.target.getId());
-                const key = (item.group ? 'group:' : 'card:') + id;
-                label = (item.group ? '群组 ' : '角色 ') + id;
-                const snap = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', item.group ? null : id, item.group ? id : null);
-                const values = snap.getValues();
-                if (s.storage.getString('applied:' + key, '') !== 'yes')
-                    save(s, 'backup:' + key, JSON.stringify(serialize(values)));
-                const next = modified(values, path, resolved, options);
-                const result = String(bridge.callStatic(item.group ? 'commitGroupTheme' : 'commitCardTheme', s.app, id, next));
-                if (result !== 'ok')
-                    throw new Error(result);
-                save(s, 'applied:' + key, 'yes');
-                applied += 1;
-                diag('[apply-all] ' + key + ' ok');
-            }
-            catch (error) {
-                diag('[apply-all] ' + (label || 'unknown') + ' failed: ' + String(error));
-                failed.push((label || '未命名目标') + '：' + String(error));
-            }
-        }
-        save(s, OPT_LAST_VARIANT, resolved);
-        const name = resolved === 'light' ? '米白' : '暖黑';
-        let message = '已把' + name + '主题应用到 ' + applied + ' 个角色';
-        if (failed.length)
-            message += '；' + failed.length + ' 项失败：' + failed.slice(0, 3).join(' / ');
-        if (art.failed.length)
-            message += '；星芒图有 ' + art.failed.length + ' 张未就绪';
-        diag('[apply-all] done applied=' + applied + ' failed=' + failed.length);
-        return { success: failed.length === 0, version: VERSION, variant: resolved, applied, failed, message };
-    }
-    finally {
-        running = false;
-    }
-}
-
-/**
- * Switches only the background image, keeping palette/options untouched.
- *
- * Used by the empty-chat hook: an empty conversation shows the icon+greeting
- * art, and the first message swaps it back to the normal background.
- *
- * @param emptyState true to show the empty-state art, false for the normal one
- */
-function listToArray(list: any): any[] {
-    const out: any[] = [];
-    if (!list)
-        return out;
-    // The bridge may hand back a JS array, a JS array-like wrapper, a Java
-    // List or a Kotlin List. Try each shape instead of assuming one.
-    try {
-        if (Array.isArray(list)) {
-            diag('[list] js array len=' + list.length);
-            return list.slice();
-        }
-    }
-    catch (error) {
-        // ignore
-    }
-    try {
-        const length = Number(list.length);
-        if (Number.isFinite(length) && length >= 0 && length < 100000) {
-            for (let i = 0; i < length; i += 1)
-                out.push(list[i]);
-            if (out.length) {
-                diag('[list] array-like len=' + length);
-                return out;
-            }
-        }
-    }
-    catch (error) {
-        diag('[list] length failed: ' + String(error));
-    }
-    try {
-        const size = Number(list.size());
-        if (Number.isFinite(size) && size >= 0) {
-            for (let i = 0; i < size; i += 1)
-                out.push(list.get(i));
-            diag('[list] java list size=' + size);
-            return out;
-        }
-        diag('[list] size not finite: ' + String(list.size()));
-    }
-    catch (error) {
-        diag('[list] size failed: ' + String(error));
-    }
-    try {
-        const iterator = list.iterator();
-        while (iterator.hasNext())
-            out.push(iterator.next());
-        diag('[list] iterator len=' + out.length);
-    }
-    catch (error) {
-        diag('[list] iterator failed: ' + String(error));
-    }
-    return out;
-}
-async function collectPromptTargets(app: JavaBridgeInstance): Promise<{ items: { target: JavaBridgeInstance; group: boolean }[]; problems: string[] }> {
-    const items: { target: JavaBridgeInstance; group: boolean }[] = [];
-    const problems: string[] = [];
-    try {
-        const CardManager = Java.type('com.ai.assistance.operit.data.preferences.CharacterCardManager');
-        const cardManager = CardManager.Companion.getInstance(app);
-        diag('[collect] card manager ok');
-        const cards = await cardManager.callSuspend('getAllCharacterCards');
-        diag('[collect] cards raw=' + String(cards && cards.className) + ' type=' + typeof cards);
-        const cardList = listToArray(cards);
-        diag('[collect] cards parsed=' + cardList.length);
-        for (const card of cardList)
-            items.push({ target: card, group: false });
-    }
-    catch (error) {
-        diag('[collect] card manager failed: ' + String(error));
-        problems.push('character card list failed: ' + String(error));
-    }
-    try {
-        const GroupManager = Java.type('com.ai.assistance.operit.data.preferences.CharacterGroupCardManager');
-        const groupManager = GroupManager.Companion.getInstance(app);
-        const groups = await groupManager.callSuspend('getAllCharacterGroupCards');
-        diag('[collect] groups raw=' + String(groups && groups.className) + ' type=' + typeof groups);
-        const groupList = listToArray(groups);
-        diag('[collect] groups parsed=' + groupList.length);
-        for (const group of groupList)
-            items.push({ target: group, group: true });
-    }
-    catch (error) {
-        diag('[collect] group manager failed: ' + String(error));
-        problems.push('character group list failed: ' + String(error));
-    }
-    diag('[collect] total items=' + items.length);
-    return { items, problems };
-}
-function themePrefixOf(s: any, id: string, group: boolean): string {
-    try {
-        const viaHost = group ? s.prefs.getCharacterGroupThemePrefix(id) : s.prefs.getCharacterCardThemePrefix(id);
-        const text = String(viaHost);
-        if (text)
-            return text;
-    }
-    catch (error) {
-        diag('[prefix] host method failed: ' + String(error));
-    }
-    return (group ? 'character_group_theme_' : 'character_card_theme_') + id;
-}
-export async function applyThemeToAll(variant?: ThemeVariant) {
-    diag('[apply-all] enter variant=' + String(variant));
-    if (variant !== undefined && variant !== 'dark' && variant !== 'light')
-        throw new Error('未知配色：' + String(variant));
-    if (running)
-        throw new Error('主题操作正在进行。');
-    // The active role has to carry the palette before it can act as clone source.
-    try {
-        const pre = await scope();
-        diag('[apply-all] active applied=' + pre.storage.getString('applied:' + pre.key, ''));
-        if (pre.storage.getString('applied:' + pre.key, '') !== 'yes') {
-            await applyTheme(null, variant);
-            diag('[apply-all] active apply ok');
-        }
-    }
-    catch (error) {
-        diag('[apply-all] active apply failed: ' + String(error));
-        throw error;
-    }
-    running = true;
-    try {
-        const s = await scope();
-        const resolved = s.values.string('theme_mode') === 'light' ? 'light' : 'dark';
-        const art = await ensureArtAssets(s.storage);
-        diag('[apply-all] art failed=' + art.failed.length);
-        const srcPrefix = themePrefixOf(s, s.id, s.group);
-        diag('[apply-all] start variant=' + resolved + ' srcPrefix=' + srcPrefix);
-        const found = await collectPromptTargets(s.app);
-        diag('[apply-all] targets=' + found.items.length);
-        const failed: string[] = found.problems.slice();
-        let applied = 0;
-        for (const item of found.items) {
-            let label = '';
-            try {
-                const id = String(item.target.getId());
-                const key = (item.group ? 'group:' : 'card:') + id;
-                label = (item.group ? '群组 ' : '角色 ') + id;
-                if (key === s.key) {
-                    applied += 1;
-                    continue;
-                }
-                const snap = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', item.group ? null : id, item.group ? id : null);
-                const values = snap.getValues();
-                if (s.storage.getString('applied:' + key, '') !== 'yes')
-                    save(s, 'backup:' + key, JSON.stringify(serialize(values)));
-                const dstPrefix = themePrefixOf(s, id, item.group);
-                diag('[apply-all] clone -> ' + dstPrefix);
-                await s.prefs.callSuspend('cloneThemeBetweenPrefixes', srcPrefix, dstPrefix);
-                save(s, 'applied:' + key, 'yes');
-                applied += 1;
-                diag('[apply-all] ' + key + ' ok');
-            }
-            catch (error) {
-                diag('[apply-all] ' + (label || 'unknown') + ' failed: ' + String(error));
-                failed.push((label || '未命名目标') + '：' + String(error));
-            }
-        }
-        save(s, OPT_LAST_VARIANT, resolved);
-        const name = resolved === 'light' ? '米白' : '暖黑';
-        let message = '已把' + name + '主题应用到 ' + applied + ' 个角色';
-        if (failed.length)
-            message += '；' + failed.length + ' 项失败：' + failed.slice(0, 3).join(' / ');
-        if (art.failed.length)
-            message += '；星芒图有 ' + art.failed.length + ' 张未就绪';
-        diag('[apply-all] done applied=' + applied + ' failed=' + failed.length);
-        return { success: failed.length === 0, version: VERSION, variant: resolved, applied, failed, message };
-    }
-    finally {
-        running = false;
-    }
-}
-
-/**
- * Switches only the background image, keeping palette/options untouched.
- *
- * Used by the empty-chat hook: an empty conversation shows the icon+greeting
- * art, and the first message swaps it back to the normal background.
- *
- * @param emptyState true to show the empty-state art, false for the normal one
- */
-function listToArray(list: any): any[] {
-    const out: any[] = [];
-    if (!list)
-        return out;
-    // The bridge may hand back a JS array, a JS array-like wrapper, a Java
-    // List or a Kotlin List. Try each shape instead of assuming one.
-    try {
-        if (Array.isArray(list)) {
-            diag('[list] js array len=' + list.length);
-            return list.slice();
-        }
-    }
-    catch (error) {
-        // ignore
-    }
-    try {
-        const length = Number(list.length);
-        if (Number.isFinite(length) && length >= 0 && length < 100000) {
-            for (let i = 0; i < length; i += 1)
-                out.push(list[i]);
-            if (out.length) {
-                diag('[list] array-like len=' + length);
-                return out;
-            }
-        }
-    }
-    catch (error) {
-        diag('[list] length failed: ' + String(error));
-    }
-    try {
-        const size = Number(list.size());
-        if (Number.isFinite(size) && size >= 0) {
-            for (let i = 0; i < size; i += 1)
-                out.push(list.get(i));
-            diag('[list] java list size=' + size);
-            return out;
-        }
-        diag('[list] size not finite: ' + String(list.size()));
-    }
-    catch (error) {
-        diag('[list] size failed: ' + String(error));
-    }
-    try {
-        const iterator = list.iterator();
-        while (iterator.hasNext())
-            out.push(iterator.next());
-        diag('[list] iterator len=' + out.length);
-    }
-    catch (error) {
-        diag('[list] iterator failed: ' + String(error));
-    }
-    return out;
-}
-async function collectPromptTargets(app: JavaBridgeInstance): Promise<{ items: { target: JavaBridgeInstance; group: boolean }[]; problems: string[] }> {
-    const items: { target: JavaBridgeInstance; group: boolean }[] = [];
-    const problems: string[] = [];
-    try {
-        const CardManager = Java.type('com.ai.assistance.operit.data.preferences.CharacterCardManager');
-        const cardManager = CardManager.Companion.getInstance(app);
-        diag('[collect] card manager ok');
-        const cards = await cardManager.callSuspend('getAllCharacterCards');
-        diag('[collect] cards raw=' + String(cards && cards.className) + ' type=' + typeof cards);
-        const cardList = listToArray(cards);
-        diag('[collect] cards parsed=' + cardList.length);
-        for (const card of cardList)
-            items.push({ target: card, group: false });
-    }
-    catch (error) {
-        diag('[collect] card manager failed: ' + String(error));
-        problems.push('character card list failed: ' + String(error));
-    }
-    try {
-        const GroupManager = Java.type('com.ai.assistance.operit.data.preferences.CharacterGroupCardManager');
-        const groupManager = GroupManager.Companion.getInstance(app);
-        const groups = await groupManager.callSuspend('getAllCharacterGroupCards');
-        diag('[collect] groups raw=' + String(groups && groups.className) + ' type=' + typeof groups);
-        const groupList = listToArray(groups);
-        diag('[collect] groups parsed=' + groupList.length);
-        for (const group of groupList)
-            items.push({ target: group, group: true });
-    }
-    catch (error) {
-        diag('[collect] group manager failed: ' + String(error));
-        problems.push('character group list failed: ' + String(error));
-    }
-    diag('[collect] total items=' + items.length);
-    return { items, problems };
-}
-export async function applyThemeToAll(variant?: ThemeVariant) {
-    if (variant !== undefined && variant !== 'dark' && variant !== 'light')
-        throw new Error('未知配色：' + String(variant));
-    if (running)
-        throw new Error('主题操作正在进行。');
-    // The host only exposes per-target writes through the internal ActivePrompt
-    // object, and character cards are not that object. Its stable public path is
-    // cloning one role's theme namespace onto another, so the active role has to
-    // carry the palette first and then acts as the source.
-    const pre = await scope();
-    if (pre.storage.getString('applied:' + pre.key, '') !== 'yes')
-        await applyTheme(null, variant);
-    running = true;
-    try {
-        const s = await scope();
-        const resolved = s.values.string('theme_mode') === 'light' ? 'light' : 'dark';
-        const art = await ensureArtAssets(s.storage);
-        const srcPrefix = String(s.group
-            ? s.prefs.getCharacterGroupThemePrefix(s.id)
-            : s.prefs.getCharacterCardThemePrefix(s.id));
-        diag('[apply-all] start variant=' + resolved + ' srcPrefix=' + srcPrefix);
-        const found = await collectPromptTargets(s.app);
-        diag('[apply-all] targets=' + found.items.length);
-        const failed: string[] = found.problems.slice();
-        let applied = 0;
-        for (const item of found.items) {
-            let label = '';
-            try {
-                const id = String(item.target.getId());
-                const key = (item.group ? 'group:' : 'card:') + id;
-                label = (item.group ? '群组 ' : '角色 ') + id;
-                if (key === s.key) {
-                    applied += 1;
-                    continue;
-                }
-                const snap = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', item.group ? null : id, item.group ? id : null);
-                const values = snap.getValues();
-                if (s.storage.getString('applied:' + key, '') !== 'yes')
-                    save(s, 'backup:' + key, JSON.stringify(serialize(values)));
-                const dstPrefix = String(item.group
-                    ? s.prefs.getCharacterGroupThemePrefix(id)
-                    : s.prefs.getCharacterCardThemePrefix(id));
-                await s.prefs.callSuspend('cloneThemeBetweenPrefixes', srcPrefix, dstPrefix);
-                save(s, 'applied:' + key, 'yes');
-                applied += 1;
-                diag('[apply-all] ' + key + ' ok -> ' + dstPrefix);
-            }
-            catch (error) {
-                diag('[apply-all] ' + (label || 'unknown') + ' failed: ' + String(error));
-                failed.push((label || '未命名目标') + '：' + String(error));
-            }
-        }
-        save(s, OPT_LAST_VARIANT, resolved);
-        const name = resolved === 'light' ? '米白' : '暖黑';
-        let message = '已把' + name + '主题应用到 ' + applied + ' 个角色';
-        if (failed.length)
-            message += '；' + failed.length + ' 项失败：' + failed.slice(0, 3).join(' / ');
-        if (art.failed.length)
-            message += '；星芒图有 ' + art.failed.length + ' 张未就绪';
-        diag('[apply-all] done applied=' + applied + ' failed=' + failed.length);
-        return { success: failed.length === 0, version: VERSION, variant: resolved, applied, failed, message };
-    }
-    finally {
-        running = false;
-    }
-}
-
 /**
  * Switches only the background image, keeping palette/options untouched.
  *
@@ -1014,14 +526,14 @@ export async function applyThemeToAll(variant?: ThemeVariant) {
     if (!file.isFile()) throw new Error('主题背景资源不存在。');
     await globalPalette(false);
     save(s, 'global:enabled', 'yes');
+    const bridge = await loadBulkBridge();
     const found = await collectPromptTargets(s.app);
     const failed: string[] = found.problems.slice();
     let applied = 0;
     for (const item of found.items) {
       let label = '';
       try {
-        const target = item.target;
-        const id = String(target.getId());
+        const id = String(item.target.getId());
         const key = (item.group ? 'group:' : 'card:') + id;
         label = (item.group ? '群组 ' : '角色 ') + id;
         const snap = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', item.group ? null : id, item.group ? id : null) as JavaBridgeInstance;
@@ -1029,11 +541,17 @@ export async function applyThemeToAll(variant?: ThemeVariant) {
         if (s.storage.getString('applied:' + key, '') !== 'yes') save(s, 'backup:' + key, JSON.stringify(serialize(values)));
         const next = modified(values, path, resolved, options);
         if (key === s.key) {
-          // The visible role needs the font_scale nudge so Compose re-reads the palette.
-          await s.manager.callSuspend('commitThemeDraft', target, next.withFloat('font_scale', Number(next.float('font_scale')) + 0.0001));
-          await s.manager.callSuspend('commitThemeDraft', target, next);
+          // s.target came from getActivePrompt(), so it really is the ActivePrompt
+          // interface. The visible role needs the font_scale nudge so Compose
+          // re-reads the palette; the bridge cannot express that.
+          await s.manager.callSuspend('commitThemeDraft', s.target, next.withFloat('font_scale', Number(next.float('font_scale')) + 0.0001));
+          await s.manager.callSuspend('commitThemeDraft', s.target, next);
         } else {
-          await s.manager.callSuspend('commitThemeDraft', target, next);
+          // Other roles are character-card entities, which commitThemeDraft rejects
+          // because they do not implement ActivePrompt. The bridge builds a real
+          // ActivePrompt$CharacterCard from the id instead.
+          const result = String(bridge.callStatic(item.group ? 'commitGroupTheme' : 'commitCardTheme', s.app, id, next));
+          if (result !== 'ok') throw new Error(result);
         }
         save(s, 'applied:' + key, 'yes');
         applied += 1;
@@ -1110,7 +628,7 @@ export async function restoreAllTheme() {
                 if (!raw)
                     throw new Error('缺少原外观备份');
                 const data: any = JSON.parse(raw);
-                const snap = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', item.group ? null : id, item.group ? id : null);
+                const snap = await s.prefs.callSuspend('resolveThemePreferenceSnapshot', item.group ? null : id, item.group ? id : null) as JavaBridgeInstance;
                 const current = serialize(snap.getValues());
                 for (const field of ['custom_chat_title', 'custom_ai_avatar_uri', 'custom_user_avatar_uri']) {
                     if (current.strings[field] === undefined)

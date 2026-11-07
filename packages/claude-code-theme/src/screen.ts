@@ -26,7 +26,7 @@ export default function ThemeScreen(ctx: ComposeDslContext) {
     if (!s.options.autoVariant) setSelected(s.variant);
     return s;
   };
-  const action = async (kind: 'apply' | 'restore' | 'status') => {
+  const action = async (kind: 'apply' | 'applyAll' | 'restore' | 'restoreAll' | 'status') => {
     if (busy) return;
     setBusy(true);
     try {
